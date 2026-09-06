@@ -48,7 +48,20 @@ jobs:
           severity: CRITICAL,HIGH
           ignore-unfixed: true
           exit-code: "1"
-          skip-dirs: /usr/local/lib/python3.9/site-packages
+        env:
+          TRIVY_CACHE_DIR: /tmp/trivy-cache
+          TRIVY_SKIP_DB_UPDATE: false
+          TRIVY_SKIP_JAVA_DB_UPDATE: true
+          TRIVY_OFFLINE_SCAN: false
+          TRIVY_DISABLE_VEX_NOTICE: true
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: /tmp/trivy-cache
+          key: trivy-db-${{ runner.os }}-${{ hashFiles('**/Dockerfile', 'requirements.txt') }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
 
   terraform:
     runs-on: ubuntu-latest
