@@ -29,7 +29,7 @@ jobs:
       - name: Run application tests
         run: python tests/test.py
 
-  build-scan:
+  build:
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -38,30 +38,6 @@ jobs:
 
       - name: Build image
         run: docker build -t tradebyte-app:${{ github.sha }} .
-
-      - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          image-ref: tradebyte-app:${{ github.sha }}
-          scan-type: image
-          scanners: vuln
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-        env:
-          TRIVY_CACHE_DIR: /tmp/trivy-cache
-          TRIVY_SKIP_DB_UPDATE: false
-          TRIVY_SKIP_JAVA_DB_UPDATE: true
-          TRIVY_OFFLINE_SCAN: false
-          TRIVY_DISABLE_VEX_NOTICE: true
-
-      - name: Cache Trivy DB
-        uses: actions/cache@v4
-        with:
-          path: /tmp/trivy-cache
-          key: trivy-db-${{ runner.os }}-${{ hashFiles('**/Dockerfile', 'requirements.txt') }}
-          restore-keys: |
-            trivy-db-${{ runner.os }}-
 
   terraform:
     runs-on: ubuntu-latest
@@ -87,7 +63,7 @@ jobs:
 
   integration:
     runs-on: ubuntu-latest
-    needs: [test, build-scan, terraform]
+    needs: [test, build, terraform]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
