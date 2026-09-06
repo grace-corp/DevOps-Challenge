@@ -3,7 +3,9 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [master]
+    branches:
+      - master
+      - feature/k8s-production-setup
 
 permissions:
   contents: read
@@ -11,12 +13,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Aligned runner with Python 3.9 to prevent legacy Tornado compilation loops
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -31,7 +31,6 @@ jobs:
   build-scan:
     runs-on: ubuntu-latest
     needs: test
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +48,6 @@ jobs:
 
   terraform:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -73,12 +71,10 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     needs: [test, build-scan, terraform]
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Create Kind cluster with custom settings to support Nginx Ingress controllers natively
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
@@ -99,13 +95,11 @@ jobs:
                 hostPort: 80
                 protocol: TCP
 
-      # Bridge context differences so infra/main.tf finds its expected "minikube" context string
       - name: Set up cluster profile context mapping
         run: |
           kubectl config set-context minikube --cluster=kind-tradebyte --user=kind-tradebyte --namespace=default
           kubectl config use-context minikube
 
-      # Explicitly provision the Ingress routing layer inside Kind
       - name: Install Nginx Ingress Controller
         run: |
           kubectl apply -f https://githubusercontent.com
@@ -114,7 +108,6 @@ jobs:
             --selector=app.kubernetes.io/component=controller \
             --timeout=180s
 
-      # Installs the missing metrics infrastructure required for HPA validation
       - name: Deploy Metrics Server
         run: |
           kubectl apply -f https://github.com
@@ -140,7 +133,6 @@ jobs:
         with:
           terragrunt-version: "0.55.2"
 
-      # STAGE 1: Generate the speculative execution blueprint file
       - name: Terragrunt Plan
         working-directory: infra
         run: |
@@ -150,13 +142,32 @@ jobs:
             -var="kube_context=minikube" \
             -out=tfplan
 
-      # STAGE 2: Apply the targeted blueprint deterministically
       - name: Terragrunt Apply
         working-directory: infra
         run: |
           terragrunt apply --auto-approve tfplan
 
-      - name: Wait for application
+      # INITIALIZE AND SEED VAULT SECRETS ENGINE AUTOMATICALLY FOR THE PIPELINE
+      - name: Provision and Hydrate Vault Parameters
+        run: |
+          log "Waiting for Vault Service to boot"
+          kubectl wait --namespace tradebyte --for=condition=ready pod --selector=app=vault --timeout=120s
+          
+          log "Configuring Vault policies and mounting engines"
+          # Run commands directly inside the running vault pod to configure it via the CLI
+          kubectl exec -n tradebyte deployment/vault -- sh -c "
+            export VAULT_ADDR='http://127.0.0.1:8200'
+            export VAULT_TOKEN='root'
+            
+            # Enable KV V2 Secret store
+            vault kv put secret/tradebyte-app ENVIRONMENT='PROD' REDIS_DB='0'
+            
+            # Create policy allowing app container to read secrets
+            echo 'path \"secret/data/tradebyte-app\" { capabilities = [\"read\"] }' > /tmp/policy.hcl
+            vault policy write tradebyte-policy /tmp/policy.hcl
+          "
+
+      - name: Wait for workloads
         run: |
           kubectl rollout status deployment/redis -n tradebyte --timeout=180s
           kubectl rollout status deployment/tradebyte-app -n tradebyte --timeout=180s

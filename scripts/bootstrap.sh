@@ -35,6 +35,19 @@ log "Applying Terraform/Terragrunt"
   terragrunt apply --auto-approve
 )
 
+log "Hydrating local HashiCorp Vault secrets engine"
+kubectl wait --namespace tradebyte --for=condition=ready pod --selector=app=vault --timeout=60s
+
+# Extract environment keys directly from your local .env file and feed them into Vault
+export $(cat .env | xargs)
+kubectl exec -n tradebyte deployment/vault -- sh -c "
+  export VAULT_ADDR='http://127.0.0.1:8200'
+  export VAULT_TOKEN='root'
+  vault kv put secret/tradebyte-app ENVIRONMENT='${ENVIRONMENT}' REDIS_DB='${REDIS_DB}'
+  echo 'path \"secret/data/tradebyte-app\" { capabilities = [\"read\"] }' > /tmp/policy.hcl
+  vault policy write tradebyte-policy /tmp/policy.hcl
+"
+# ========================================================
 log "Waiting for workloads"
 # Natively target the default context that Terraform initialized
 kubectl rollout status deployment/redis -n tradebyte --timeout=180s
