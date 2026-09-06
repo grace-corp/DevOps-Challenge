@@ -1,17 +1,15 @@
 name: CI
-
 on:
   pull_request:
   push:
     branches:
       - master
       - feature/k8s-production-setup
-
 permissions:
   contents: read
-
 jobs:
   test:
+    name: Application Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,22 +19,30 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.9"
+          cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run application tests
-        run: python tests/test.py
+        run: |
+          python tests/test.py
 
   build-scan:
+    name: Build and Security Scan
     runs-on: ubuntu-latest
     needs: test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build image
-        run: docker build -t tradebyte-app:${{ github.sha }} .
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag tradebyte-app:${{ github.sha }} \
+            .
 
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@v0.36.0
@@ -47,6 +53,7 @@ jobs:
           exit-code: "1"
 
   terraform:
+    name: Terraform Validation
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -58,72 +65,87 @@ jobs:
       - name: Setup Terragrunt
         uses: autero1/action-terragrunt@v3
         with:
-          terragrunt-version: "0.55.2"
+          terragrunt-version: "0.91.1"
 
       - name: Terraform format check
         working-directory: infra/terraform
-        run: terraform fmt -check -recursive || true
+        run: |
+          terraform fmt -check -recursive
 
-      - name: Terragrunt validate
+      - name: Terragrunt initialization
         working-directory: infra
-        run: terragrunt init -backend=false && terragrunt validate
+        run: |
+          terragrunt init -backend=false
+
+      - name: Terragrunt validation
+        working-directory: infra
+        run: |
+          terragrunt validate
 
   integration:
+    name: Kubernetes Integration
     runs-on: ubuntu-latest
-    needs: [test, build-scan, terraform]
+    needs:
+      - test
+      - build-scan
+      - terraform
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create kind cluster
+      - name: Create Kind cluster
         uses: helm/kind-action@v1
         with:
           cluster_name: tradebyte
-          config: |
-            kind: Cluster
-            apiVersion: kind.x-k8s.io/v1alpha4
-            nodes:
-            - role: control-plane
-              kubeadmConfigPatches:
-              - |
-                kind: InitConfiguration
-                nodeRegistration:
-                  kubeletExtraArgs:
-                    node-labels: "ingress-ready=true"
-              extraPortMappings:
-              - containerPort: 80
-                hostPort: 80
-                protocol: TCP
 
-      - name: Set up cluster profile context mapping
+      - name: Configure Kubernetes context
         run: |
-          kubectl config set-context minikube --cluster=kind-tradebyte --user=kind-tradebyte --namespace=default
-          kubectl config use-context minikube
+          kubectl config use-context kind-tradebyte
+          kubectl cluster-info
 
-      - name: Install Nginx Ingress Controller
+      - name: Install NGINX Ingress Controller
         run: |
-          kubectl apply -f https://githubusercontent.com
-          kubectl wait --namespace ingress-nginx \
+          kubectl apply \
+            -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.13.2/deploy/static/provider/kind/deploy.yaml
+
+          kubectl wait \
+            --namespace ingress-nginx \
             --for=condition=ready pod \
             --selector=app.kubernetes.io/component=controller \
             --timeout=180s
 
-      - name: Deploy Metrics Server
+      - name: Install Metrics Server
         run: |
-          kubectl apply -f https://github.com
-          kubectl wait --namespace kube-system \
-            --for=condition=ready pod \
-            --selector=k8s-app=metrics-server \
-            --timeout=120s
-          kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
-          kubectl rollout restart deployment metrics-server -n kube-system
-          kubectl rollout status deployment metrics-server -n kube-system --timeout=60s
+          kubectl apply \
+            -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-      - name: Build image
-        run: docker build -t tradebyte-app:${{ github.sha }} .
+          kubectl patch deployment metrics-server \
+            -n kube-system \
+            --type='json' \
+            -p='[
+              {
+                "op": "add",
+                "path": "/spec/template/spec/containers/0/args/-",
+                "value": "--kubelet-insecure-tls"
+              }
+            ]'
 
-      - name: Load image into kind
-        run: kind load docker-image tradebyte-app:${{ github.sha }} --name tradebyte
+          kubectl rollout status \
+            deployment/metrics-server \
+            -n kube-system \
+            --timeout=180s
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag tradebyte-app:${{ github.sha }} \
+            .
+
+      - name: Load image into Kind
+        run: |
+          kind load docker-image \
+            tradebyte-app:${{ github.sha }} \
+            --name tradebyte
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -131,15 +153,19 @@ jobs:
       - name: Setup Terragrunt
         uses: autero1/action-terragrunt@v3
         with:
-          terragrunt-version: "0.55.2"
+          terragrunt-version: "0.91.1"
+
+      - name: Terragrunt Init
+        working-directory: infra
+        run: |
+          terragrunt init -backend=false
 
       - name: Terragrunt Plan
         working-directory: infra
         run: |
-          terragrunt init -backend=false
           terragrunt plan \
             -var="image=tradebyte-app:${{ github.sha }}" \
-            -var="kube_context=minikube" \
+            -var="kube_context=kind-tradebyte" \
             -out=tfplan
 
       - name: Terragrunt Apply
@@ -147,35 +173,139 @@ jobs:
         run: |
           terragrunt apply --auto-approve tfplan
 
-      # INITIALIZE AND SEED VAULT SECRETS ENGINE AUTOMATICALLY FOR THE PIPELINE
-      - name: Provision and Hydrate Vault Parameters
+      - name: Verify Vault
         run: |
-          log "Waiting for Vault Service to boot"
-          kubectl wait --namespace tradebyte --for=condition=ready pod --selector=app=vault --timeout=120s
-          
-          log "Configuring Vault policies and mounting engines"
-          # Run commands directly inside the running vault pod to configure it via the CLI
-          kubectl exec -n tradebyte deployment/vault -- sh -c "
-            export VAULT_ADDR='http://127.0.0.1:8200'
-            export VAULT_TOKEN='root'
-            
-            # Enable KV V2 Secret store
-            vault kv put secret/tradebyte-app ENVIRONMENT='PROD' REDIS_DB='0'
-            
-            # Create policy allowing app container to read secrets
-            echo 'path \"secret/data/tradebyte-app\" { capabilities = [\"read\"] }' > /tmp/policy.hcl
-            vault policy write tradebyte-policy /tmp/policy.hcl
-          "
+          echo "Vault pods:"
+          kubectl get pods -n tradebyte -l app.kubernetes.io/name=vault
 
-      - name: Wait for workloads
+          echo
+          echo "Vault Agent Injector:"
+          kubectl get pods -n tradebyte -l app.kubernetes.io/name=vault-agent-injector
+
+          echo
+          echo "Vault webhook:"
+          kubectl get mutatingwebhookconfigurations | grep -i vault
+
+      - name: Verify Redis
         run: |
-          kubectl rollout status deployment/redis -n tradebyte --timeout=180s
-          kubectl rollout status deployment/tradebyte-app -n tradebyte --timeout=180s
+          kubectl rollout status \
+            deployment/redis \
+            -n tradebyte \
+            --timeout=180s
 
-      - name: Verify replicas
-        run: test "$(kubectl get deployment tradebyte-app -n tradebyte -o jsonpath='{.status.readyReplicas}')" -ge 3
+      - name: Wait for TradeByte application
+        run: |
+          kubectl rollout status \
+            deployment/tradebyte-app \
+            -n tradebyte \
+            --timeout=300s
+
+      - name: Verify Vault secret injection
+        run: |
+          POD=$(kubectl get pods \
+            -n tradebyte \
+            -l app=tradebyte-app \
+            -o jsonpath='{.items[0].metadata.name}')
+
+          echo "TradeByte pod: $POD"
+
+          echo
+          echo "Containers:"
+          kubectl get pod "$POD" \
+            -n tradebyte \
+            -o jsonpath='{.spec.containers[*].name}'
+
+          echo
+          echo
+          echo "Volumes:"
+          kubectl get pod "$POD" \
+            -n tradebyte \
+            -o jsonpath='{.spec.volumes[*].name}'
+
+          echo
+          echo
+          echo "Checking injected secret..."
+
+          kubectl exec \
+            -n tradebyte \
+            "$POD" \
+            -c app \
+            -- sh -c '
+              test -f /vault/secrets/config.env
+            '
+
+          echo "Vault secret successfully injected."
+
+      - name: Verify minimum replicas
+        run: |
+          READY=$(kubectl get deployment tradebyte-app \
+            -n tradebyte \
+            -o jsonpath='{.status.readyReplicas}')
+
+          echo "Ready replicas: ${READY:-0}"
+
+          test "${READY:-0}" -ge 3
 
       - name: Verify HPA
         run: |
-          sleep 15
-          kubectl get hpa -n tradebyte
+          kubectl get hpa \
+            -n tradebyte \
+            tradebyte-app
+
+          kubectl describe hpa \
+            -n tradebyte \
+            tradebyte-app
+
+      - name: Show deployment status
+        if: always()
+        run: |
+          echo "================ PODS ================"
+          kubectl get pods -n tradebyte -o wide || true
+
+          echo
+          echo "================ SERVICES ================"
+          kubectl get svc -n tradebyte || true
+
+          echo
+          echo "================ DEPLOYMENTS ================"
+          kubectl get deployments -n tradebyte || true
+
+          echo
+          echo "================ HPA ================"
+          kubectl get hpa -n tradebyte || true
+
+          echo
+          echo "================ PDB ================"
+          kubectl get pdb -n tradebyte || true
+
+          echo
+          echo "================ INGRESS ================"
+          kubectl get ingress -n tradebyte || true
+
+      - name: Application logs
+        if: failure()
+        run: |
+          kubectl logs \
+            -n tradebyte \
+            -l app=tradebyte-app \
+            -c app \
+            --tail=200 \
+            || true
+
+      - name: Vault logs
+        if: failure()
+        run: |
+          kubectl logs \
+            -n tradebyte \
+            -l app.kubernetes.io/name=vault \
+            --tail=200 \
+            || true
+
+          echo
+          echo "Vault injector logs:"
+
+          kubectl logs \
+            -n tradebyte \
+            -l app.kubernetes.io/name=vault-agent-injector \
+            --tail=200 \
+            || true
