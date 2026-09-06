@@ -40,13 +40,28 @@ resource "kubernetes_deployment_v1" "vault" {
         security_context {
           run_as_non_root = true
           run_as_user     = 100
-          fs_group        = 1000
+          fs_group        = 100
         }
         container {
           name  = "vault"
           image = "hashicorp/vault:1.15"
-          args  = ["server", "-dev", "-dev-root-token-id=root"]
+          args  = ["server", "-dev", "-dev-root-token-id=root", "-dev-listen-address=0.0.0.0:8200"]
           
+          # ====== ADDED ENVIRONMENT FLAGS TO SKIP PRIVILEGED OPERATIONS ======
+          env {
+            name  = "SKIP_CHOWN"
+            value = "true"
+          }
+          env {
+            name  = "SKIP_SETCAP"
+            value = "true"
+          }
+          env {
+            name  = "VAULT_LOCAL_CONFIG"
+            value = "disable_mlock = true"
+          }
+          # ===================================================================
+
           port {
             container_port = 8200
           }
@@ -66,6 +81,22 @@ resource "kubernetes_deployment_v1" "vault" {
               drop = ["ALL"]
             }
           }
+          volume_mount {
+            name       = "vault-config"
+            mount_path = "/vault/config"
+          }
+          volume_mount {
+            name       = "vault-file"
+            mount_path = "/vault/file"
+          }
+        }
+        volume {
+          name = "vault-config"
+          empty_dir {}
+        }
+        volume {
+          name = "vault-file"
+          empty_dir {}
         }
       }
     }

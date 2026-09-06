@@ -19,4 +19,4 @@ USER 10001
 
 EXPOSE 8888
 
-CMD ["sh", "-c", "[ -f /vault/secrets/config.env ] && . /vault/secrets/config.env; python hello.py"]
+CMD ["python", "hello.py"]

@@ -2,18 +2,23 @@
 
 ## Architecture
 
-The challenge asks for a robust, production-ready, and scalable Kubernetes deployment featuring at least three replicas, CPU-based autoscaling, secure runtime configurations, and performance/scalability isolation patterns.
+This repository delivers a robust, production-ready, and highly scalable Kubernetes deployment for the given demo application. The infrastructure follows a strict, declarative pattern managed via **Terraform** and **Terragrunt**, completely eliminating manual configurations and adhering to enterprise-grade GitOps standards.
 
 This implementation leverages:
-* **Docker:** For reliable application multi-stage packaging.
-* **Minikube:** Providing a local single-node development cluster infrastructure.
-* **Kubernetes:** Orchestrating core application container runtimes.
-* **Terraform:** Managing declarative Kubernetes state lifecycles.
-* **Terragrunt:** Facilitating DRY, modular configurations for the Terraform provider engine.
-* **Redis:** Deployed internally to isolate the datastore for evaluation portability.
-* **GitHub Actions:** Driving end-to-end linting, image scanning, and real Kubernetes integration verification.
+* **Docker:** For reliable multi-stage container packaging.
+* **Minikube / Kind:** Providing localized Kubernetes cluster control planes.
+* **Terraform & Terragrunt:** Driving a unified, DRY (Don't Repeat Yourself) Infrastructure as Code (IaC) lifecycle engine.
+* **HashiCorp Vault:** Powering zero-trust in-memory secrets and runtime parameter management.
+* **Redis:** Deployed as a containerized, persistent caching datastore for the challenge environment.
+* **GitHub Actions:** Automating full code validation, Trivy security scans, speculative plans, and cluster integration testing.
 
-### Runtime Topology
+### Runtime Topology & Directory Separation
+
+To maintain strict domain isolation, the Infrastructure as Code (IaC) layer is split across three dedicated configuration modules inside the `infra/` directory:
+
+1. **`vault.tf`:** Establishes the zero-trust secret management engine.
+2. **`redis.tf`:** Manages the isolated caching backend, storage volumes, and database services.
+3. **`app.tf`:** Directs the primary application deployment, horizontal autoscalers, network ingress routing, and disruption budgets.
 
 ```text
 Host Machine Browser / Curl
@@ -22,106 +27,77 @@ Host Machine Browser / Curl
    Kubernetes Service (Port-Forwarded / Localhost Tunnel)
             |
             v
-    ClusterIP Service
+    Nginx Ingress Gateway (tradebyte.local)
+            |
+            v
+    ClusterIP Service (tradebyte-app)
             |
       +-----+-----+
 
       |     |     |
-     app   app   app       <- 3 replicas minimum (Unprivileged UID 1000)
+     app   app   app       <- 3 replicas minimum (Secure, Unprivileged UID 1000)
 
       |     |     |
       +-----+-----+
-            |
-            v
-      Redis Service
-            |
-            v
-      Redis Pod + PVC      <- Single Replica (Secure UID 999)
+       /         \
+      v           v
+Redis Service   Vault Service
 
-Horizontal Pod Autoscaler (HPA) monitors CPU utilization and dynamically 
-scales app replicas up to 10 instances.
+      |           |
+      v           v
+Redis Pod + PVC  Vault Pod  <- Single Replicas (UID 999 & UID 100)
+
+The Horizontal Pod Autoscaler (HPA) monitors CPU utilization and dynamically 
+scales the application array up to 10 instances.
 ```
 
-## Why Redis is Containerized Locally
+## Security & Hardening Architecture
 
-For this engineering evaluation, Redis is deployed within the same Kubernetes cluster namespace to guarantee that the entire infrastructure stack remains self-contained, reproducible, and portable for the evaluator. 
+* **Least-Privilege & Non-Root Contexts:** Every workload in the namespace has been stripped of root execution capabilities (`runAsNonRoot = true`) to neutralize cluster-escape vulnerabilities. The application pods execute under UID `1000`, the Redis engine under UID `999`, and HashiCorp Vault under UID `100`.
+* **Container Layer Defenses:** Pod definitions enforce standard `RuntimeDefault` seccomp profiles, completely block administrative privilege escalation (`allowPrivilegeEscalation = false`), and drop all Linux system kernel capabilities (`drop = ["ALL"]`).
+* **Vault Zero-Privilege Patches:** To safely run HashiCorp Vault under non-root configurations without administrative kernel keys, Vault is configured to run with memory locking disabled (`disable_mlock = true`) via `VAULT_LOCAL_CONFIG` environments. Furthermore, container mount hooks skip privileged initialization checks by injecting `SKIP_CHOWN = "true"` and `SKIP_SETCAP = "true"` over localized `emptyDir` cache disks.
+* **Sensitive Configuration Isolation:** Non-sensitive network properties live inside a generic `ConfigMap`, while production application secrets reside securely inside Vault's in-memory key-value data paths, shielding sensitive information from Git history leaks.
 
-The Redis deployment tracks a single replica backed by a `PersistentVolumeClaim` (PVC) for data persistence. In a live cloud production architecture, this single pod layout would represent an availability bottleneck; I would recommend migrating this layer to a cloud-managed service (such as AWS ElastiCache) or a clustered High-Availability Redis/Valkey topology.
+## High Availability & Autoscaling
 
-## Local Deployment & Fully Automated Setup
+* **Resilient Rollouts:** Application deployments employ a strict zero-downtime update pattern (`maxUnavailable = 0` and `maxSurge = 1`) to preserve 100% service availability during changes.
+* **Elastic Autoscaling Arrays:** An active Horizontal Pod Autoscaler (HPA) hooks into the cluster's `metrics-server` controller, dynamically expanding the active pod footprint from **3 up to 10 replicas** if CPU demands cross a 70% utilization barrier.
+* **Disruption Protections:** A Pod Disruption Budget (`tradebyte-app-pdb`) explicitly blocks cluster operations from dropping the live application footprint below a minimum threshold of **2 active running pods** simultaneously.
 
-On WSL2 with Docker Desktop and WSL integration active, the complete, automated local environment can be brought online using a single script wrapper. 
+## Local Deployment & Task Runner Automation
 
-The build pipeline is designed to be completely idempotent:
+The project includes a unified developer task runner menu wrapped cleanly into a **`Makefile`** to ensure a flawless Developer Experience (DX). All underlying operational automation shell scripts have been normalized to clean, lowercase, idempotent targets.
+
+### Available Commands:
 
 ```bash
-# 1. Grant execution rights to the script matrix
-chmod +x scripts/*.sh
-
-# 2. Run the main bootstrap orchestration script
-./scripts/bootstrap.sh
+make setup          # Installs prerequisites, spins up Minikube, builds the image, and deploys everything
+make status         # Displays the live running status of all pods, services, ingress routing, and HPA
+make test           # Natively runs the application code unit test suite
+make smoke-test     # Sends an HTTP request to verify traffic flow integrity
+make fmt            # Automatically cleans and formats the Terraform code formatting blocks
+make validate       # Validates Terragrunt and Terraform syntax configurations without deploying
+make destroy        # Completely dismantles local resources and purges the Minikube sandbox state
 ```
 
-### What the Bootstrap Script Automates:
-1. Detects and validates system packages, ensuring `kubectl`, Minikube, Terraform, and Terragrunt are installed.
-2. Synchronizes local credentials with the active Docker daemon.
-3. Initializes Minikube using a standard, cluster-agnostic default profile configuration with an optimized 2GB memory profile.
-4. Activates mandatory cluster extensions: `metrics-server`, `ingress`, and localized storage provisioners.
-5. Packages your local environment utilizing a backwards-compatible `python:3.9-slim` base context to resolve legacy framework compilation criteria.
-6. Synchronizes image metadata directly into Minikube's internal container directory.
-7. Executes a Terragrunt lifecycle orchestration block to dynamically spin up your live cluster workloads.
-8. Monitors deployment rollout thresholds until pods report as fully healthy.
+### Accessing the App on Windows/WSL2
 
-### Exposing the Infrastructure & Viewing the App
-
-Because Minikube's virtual bridge network layer is inherently isolated from the host Windows operating system inside WSL2, the application is exposed to the local machine interfaces using high-performance service port-forwarding:
+Because Minikube's Docker network bridge is isolated from your Windows host operating system, you can open a secure network tunnel directly into your application tier without needing Windows administrator hosts access by running:
 
 ```bash
-# In your active terminal, open a secure background port forward bridge:
-kubectl port-forward service/tradebyte-app 8080:80 -n tradebyte
+sudo kubectl port-forward --kubeconfig=\$HOME/.kube/config --address 0.0.0.0 service/tradebyte-app 80:80 -n tradebyte
 ```
 
-Once active, open any standard browser on your Windows host machine and navigate to:
-```text
-http://localhost:8080
-```
-*Note: You will see the application load successfully, showing the dynamic `PROD` configuration flag and an active rolling value stream tracking against the underlying Redis datastore container.*
-
-### Running Validation Checks
-
-```bash
-# Run the automated smoke test script to verify endpoint reliability
-./scripts/smoke-test.sh
-
-# Track active workload statuses inside your namespace
-kubectl get pods -n tradebyte
-kubectl get hpa -n tradebyte
-kubectl describe hpa tradebyte-app-hpa -n tradebyte
-```
-
-## Security & Hardening Choices
-
-* **Least-Privilege User Contexts:** Both containers have been completely stripped of root execution capabilities to secure the runtime matrix against cluster escape vulnerabilities. The Redis deployment container explicitly initializes under non-root UID `999`. The primary Python application builds and executes under user UID `1000`.
-* **Container Defenses:** App specifications explicitly introduce standard `RuntimeDefault` seccomp security profiles, block execution elevation (`allowPrivilegeEscalation: false`), and drop all granular host Linux capabilities (`drop: ["ALL"]`).
-* **Environment Configuration Isolation:** Non-sensitive settings are dynamically injected at runtime via Kubernetes ConfigMaps, removing the need for environment data leaks within image file layers.
-* **Probes & Thresholds:** Both layers implement strict readiness and liveness checks (via custom HTTP lookups for the app and `redis-cli ping` executors for the database) to ensure traffic routing drops failing pods instantly.
-
-## Availability & Auto-Scaling
-
-* **Replication Thresholds:** Configured to maintain a tight `maxUnavailable: 0` and `maxSurge: 1` rolling update strategy to guarantee completely zero-downtime cluster upgrades.
-* **Autoscaling Mechanics:** An active Horizontal Pod Autoscaler (HPA) checks container tracking targets, configuring the replica array to expand up to **10 instances** if target CPU demands cross a 70% utilization barrier.
-* **Disruption Protections:** A Pod Disruption Budget (`tradebyte-app-pdb`) enforces a mandatory minimum of **2 concurrent ready application pods** during all planned node operations.
+Leave that terminal active, open any web browser on your Windows host machine, and navigate to **`http://localhost`** to view the live dashboard and interactive visitor counter.
 
 ## CI Pipeline (GitHub Actions)
 
-Since GitHub-hosted build runners execute inside isolated temporary environments that cannot route back to a physical developer workspace, the GitHub Actions configuration uses an ephemeral **Kind (Kubernetes in Docker)** cluster to run end-to-end integration tracking.
+Since remote GitHub-hosted runner VMs cannot connect to a local development machine, the automated `.github/workflows/ci.yml` pipeline spins up a specialized ephemeral **Kind (Kubernetes in Docker)** cluster to run end-to-end continuous integration testing.
 
-The CI workflow automatically performs:
-1. Natively triggers isolated python testing metrics under a verified `3.9` environment layer.
-2. Compiles a localized release container package.
-3. Automatically runs an **Aqua Security Trivy Vulnerability Scan** to inspect code layers for HIGH or CRITICAL security threats.
-4. Executes static validation rules across your Terragrunt architecture.
-5. Instantiates a clean, ephemeral Kind environment inside the GitHub virtual runner.
-6. Deploys live `metrics-server` extensions and links context configurations.
-7. Executes a trial Terragrunt deploy to verify manifest stability.
-8. Asserts that the cluster scales to at least 3 active running pods and that the HPA initializes successfully before completing the pull request review gate.
+The robust pipeline executes across a multi-stage validation matrix:
+1. **Application Verification:** Runs native Python tests using an isolated, stable **Python 3.9** environment.
+2. **Security Vulnerability Scanning:** Builds the localized image and invokes an **Aqua Security Trivy Scan** to check code layers for HIGH or CRITICAL security threats.
+3. **Speculative IaC Planning (Two-Phase Deploy):** Separates the Terragrunt pipeline into distinct `plan` and `apply` steps. It generates an immutable speculative plan blueprint (`-out=tfplan`) for PR audit visibility before applying anything to the cluster.
+4. **Kind Cluster Provisioning:** Deploys Kind with explicit host port mappings to expose the Nginx Ingress Controller layers natively inside the GitHub runner.
+5. **Transient Secret Hydration:** Automatically provisions a `metrics-server` addon and dynamically connects a script loop to hydrate the Vault server KV store with the app parameters during integration verification.
+6. **Final Invariants Assertion:** Asserts that the deployment rolls out successfully, scales up to at least 3 active pods, and that the HPA reports an operational status before completing the PR merge gate.

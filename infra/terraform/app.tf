@@ -10,10 +10,12 @@ resource "kubernetes_config_map_v1" "app" {
     namespace = kubernetes_namespace_v1.this.metadata[0].name
   }
   data = {
-    HOST       = var.host
-    PORT       = tostring(var.app_port)
-    REDIS_HOST = var.redis_name
-    REDIS_PORT = tostring(var.redis_port)
+    ENVIRONMENT = var.environment
+    HOST        = var.host
+    PORT        = tostring(var.app_port)
+    REDIS_HOST  = var.redis_name
+    REDIS_PORT  = tostring(var.redis_port)
+    REDIS_DB    = tostring(var.redis_db)
   }
 }
 
@@ -39,33 +41,37 @@ resource "kubernetes_deployment_v1" "app" {
         app = var.app_name
       }
     }
-    template {
-      metadata {
-        labels = {
-          app = var.app_name
-        }
-        annotations = {
-          "://hashicorp.com"               = "true"
-          "://hashicorp.com"     = "true"
-          "://hashicorp.com-status"        = "update"
-          "://hashicorp.com"                       = "tradebyte-app"
-          "://hashicorp.com-secret-config.env" = "secret/data/tradebyte-app"
-          "://hashicorp.com-template-config.env" = <<EOT
-            {{- with secret "secret/data/tradebyte-app" -}}
-            export ENVIRONMENT="{{ .Data.data.ENVIRONMENT }}"
-            export REDIS_DB="{{ .Data.data.REDIS_DB }}"
-            {{- end -}}
-          EOT
-        }
+template {
+  metadata {
+    labels = {
+      app = var.app_name
+    }
+
+    annotations = {
+      "vault.hashicorp.com/agent-inject" = "true"
+      "vault.hashicorp.com/agent-prepopulate-only" = "true"
+      "vault.hashicorp.com/agent-inject-status" = "update"
+      "vault.hashicorp.com/role" = "tradebyte-app"
+      "vault.hashicorp.com/agent-inject-secret-config.env" = "secret/data/tradebyte-app"
+
+      "vault.hashicorp.com/agent-inject-template-config.env" = <<-EOT
+        {{- with secret "secret/data/tradebyte-app" -}}
+        export ENVIRONMENT="{{ .Data.data.ENVIRONMENT }}"
+        export REDIS_DB="{{ .Data.data.REDIS_DB }}"
+        {{- end -}}
+      EOT
+    }
+  }
+
+  spec {
+    security_context {
+      run_as_non_root = true
+      run_as_user     = 1000
+
+      seccomp_profile {
+        type = "RuntimeDefault"
       }
-      spec {
-        security_context {
-          run_as_non_root = true
-          run_as_user     = 1000
-          seccomp_profile {
-            type = "RuntimeDefault"
-          }
-        }
+    }
         topology_spread_constraint {
           max_skew           = 1
           topology_key       = "kubernetes.io/hostname"

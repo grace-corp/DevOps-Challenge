@@ -39,7 +39,7 @@ jobs:
         run: docker build -t tradebyte-app:${{ github.sha }} .
 
       - name: Trivy vulnerability scan
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: tradebyte-app:${{ github.sha }}
           severity: CRITICAL,HIGH
