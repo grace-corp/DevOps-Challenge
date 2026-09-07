@@ -16,6 +16,8 @@ resource "kubernetes_service_v1" "redis" {
 }
 
 resource "kubernetes_persistent_volume_claim_v1" "redis" {
+  wait_until_bound = false
+
   metadata {
     name      = "${var.redis_name}-data"
     namespace = kubernetes_namespace_v1.this.metadata[0].name
