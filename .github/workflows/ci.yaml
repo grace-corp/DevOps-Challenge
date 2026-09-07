@@ -68,36 +68,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Create kind config file
-        run: |
-          cat > kind-config.yaml <<EOF
-          kind: Cluster
-          apiVersion: kind.x-k8s.io/v1alpha4
-          nodes:
-          - role: control-plane
-            kubeadmConfigPatches:
-            - |
-              kind: InitConfiguration
-              nodeRegistration:
-                kubeletExtraArgs:
-                  node-labels: "ingress-ready=true"
-            extraPortMappings:
-            - containerPort: 80
-              hostPort: 80
-              protocol: TCP
-          EOF
-
       - name: Create kind cluster
         uses: helm/kind-action@v1
         with:
           cluster_name: tradebyte
-          config: kind-config.yaml
+          config: |
+            kind: Cluster
+            apiVersion: kind.x-k8s.io/v1alpha4
+            nodes:
+            - role: control-plane
+              kubeadmConfigPatches:
+              - |
+                kind: InitConfiguration
+                nodeRegistration:
+                  kubeletExtraArgs:
+                    node-labels: "ingress-ready=true"
+              extraPortMappings:
+              - containerPort: 80
+                hostPort: 80
+                protocol: TCP
 
       - name: Install local-path provisioner
         run: |
           kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml
           kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
           kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=60s
+          
+          echo "Storage classes:"
+          kubectl get storageclass
 
       - name: Configure kubectl context
         run: kubectl config use-context kind-tradebyte
@@ -117,11 +115,10 @@ jobs:
             -p='[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--kubelet-insecure-tls"}]'
           kubectl rollout status deployment/metrics-server -n kube-system --timeout=180s
 
-      - name: Build image
-        run: docker build -t tradebyte-app:${{ github.sha }} .
-
-      - name: Load image into kind
-        run: kind load docker-image tradebyte-app:${{ github.sha }} --name tradebyte
+      - name: Build and load image
+        run: |
+          docker build -t tradebyte-app:${{ github.sha }} .
+          kind load docker-image tradebyte-app:${{ github.sha }} --name tradebyte
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -142,7 +139,23 @@ jobs:
 
       - name: Terragrunt Apply
         working-directory: infra
-        run: terragrunt apply --auto-approve tfplan
+        run: |
+          terragrunt apply --auto-approve tfplan
+
+      - name: Debug resources
+        if: always()
+        run: |
+          echo "=== Storage Classes ==="
+          kubectl get storageclass
+          
+          echo "=== PVCs ==="
+          kubectl get pvc -n tradebyte || true
+          
+          echo "=== Pods ==="
+          kubectl get pods -n tradebyte -o wide || true
+          
+          echo "=== Events (last 20) ==="
+          kubectl get events -n tradebyte --sort-by='.lastTimestamp' | tail -20 || true
 
       - name: Provision Vault secrets
         run: |
