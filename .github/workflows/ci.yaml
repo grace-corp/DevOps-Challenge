@@ -86,7 +86,6 @@ jobs:
               hostPort: 80
               protocol: TCP
           EOF
-          cat kind-config.yaml
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
@@ -97,16 +96,11 @@ jobs:
       - name: Install local-path provisioner
         run: |
           kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.26/deploy/local-path-storage.yaml
-          kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+          kubectl patch storageclass standard -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
           kubectl wait --for=condition=ready pod -l app=local-path-provisioner -n local-path-storage --timeout=60s
-          
-          echo "Storage classes:"
-          kubectl get storageclass
 
       - name: Configure kubectl context
-        run: |
-          kubectl config use-context kind-tradebyte
-          kubectl cluster-info
+        run: kubectl config use-context kind-tradebyte
 
       - name: Install NGINX Ingress Controller
         run: |
@@ -128,7 +122,7 @@ jobs:
           docker build -t tradebyte-app:${{ github.sha }} .
           kind load docker-image tradebyte-app:${{ github.sha }} --name tradebyte
 
-      - name: Setup Terraform
+      - name: Setup Terraform and apply infra (without app deployment)
         uses: hashicorp/setup-terraform@v3
 
       - name: Setup Terragrunt
@@ -136,39 +130,24 @@ jobs:
         with:
           terragrunt-version: "0.55.2"
 
-      - name: Terragrunt Plan
+      - name: Apply Terraform
         working-directory: infra
         run: |
           terragrunt init -backend=false
-          terragrunt plan \
+          terragrunt apply --auto-approve \
             -var="image=tradebyte-app:${{ github.sha }}" \
-            -var="kube_context=kind-tradebyte" \
-            -out=tfplan
+            -var="kube_context=kind-tradebyte"
 
-      - name: Terragrunt Apply
-        working-directory: infra
+      - name: Wait for Vault to be ready
         run: |
-          terragrunt apply --auto-approve tfplan
-
-      - name: Debug resources
-        if: always()
-        run: |
-          echo "=== Storage Classes ==="
-          kubectl get storageclass
+          echo "Waiting for Vault pod..."
+          kubectl wait --namespace tradebyte --for=condition=ready pod --selector=app=vault --timeout=120s
           
-          echo "=== PVCs ==="
-          kubectl get pvc -n tradebyte || true
-          
-          echo "=== Pods ==="
-          kubectl get pods -n tradebyte -o wide || true
-          
-          echo "=== Events (last 20) ==="
-          kubectl get events -n tradebyte --sort-by='.lastTimestamp' | tail -20 || true
+          echo "Waiting for Vault Agent Injector..."
+          kubectl wait --namespace tradebyte --for=condition=ready pod --selector=app.kubernetes.io/name=vault-agent-injector --timeout=120s
 
       - name: Provision Vault secrets
         run: |
-          kubectl wait --namespace tradebyte --for=condition=ready pod --selector=app=vault --timeout=120s
-          
           kubectl exec -n tradebyte deployment/vault -- sh -c "
             export VAULT_ADDR='http://127.0.0.1:8200'
             export VAULT_TOKEN='root'
@@ -179,10 +158,26 @@ jobs:
             vault policy write tradebyte-policy /tmp/policy.hcl
           "
 
-      - name: Wait for workloads
+      - name: Restart app deployment to trigger Vault injection
+        run: |
+          kubectl rollout restart deployment tradebyte-app -n tradebyte
+          kubectl rollout status deployment tradebyte-app -n tradebyte --timeout=180s
+
+      - name: Wait for Redis
         run: |
           kubectl rollout status deployment/redis -n tradebyte --timeout=180s
-          kubectl rollout status deployment/tradebyte-app -n tradebyte --timeout=180s
+
+      - name: Debug resources
+        if: always()
+        run: |
+          echo "=== PVCs ==="
+          kubectl get pvc -n tradebyte || true
+          
+          echo "=== Pods ==="
+          kubectl get pods -n tradebyte -o wide || true
+          
+          echo "=== App Logs ==="
+          kubectl logs -n tradebyte -l app=tradebyte-app --tail=50 || true
 
       - name: Verify replicas
         run: test "$(kubectl get deployment tradebyte-app -n tradebyte -o jsonpath='{.status.readyReplicas}')" -ge 3
